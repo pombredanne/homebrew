@@ -1,7 +1,7 @@
-require 'options'
+require "options"
 
 module Dependable
-  RESERVED_TAGS = [:build, :optional, :recommended]
+  RESERVED_TAGS = [:build, :optional, :recommended, :run]
 
   def build?
     tags.include? :build
@@ -15,11 +15,21 @@ module Dependable
     tags.include? :recommended
   end
 
+  def run?
+    tags.include? :run
+  end
+
   def required?
+    # FIXME: Should `required?` really imply `!build?`? And if so, why doesn't
+    #        any of `optional?` and `recommended?` equally imply `!build?`?
     !build? && !optional? && !recommended?
   end
 
+  def option_tags
+    tags - RESERVED_TAGS
+  end
+
   def options
-    Options.coerce(tags - RESERVED_TAGS)
+    Options.create(option_tags)
   end
 end

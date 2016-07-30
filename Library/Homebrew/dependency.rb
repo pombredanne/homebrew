@@ -1,15 +1,18 @@
-require 'dependable'
+require "dependable"
 
 # A dependency on another Homebrew formula.
 class Dependency
   include Dependable
 
-  attr_reader :name, :tags
-  attr_accessor :env_proc
+  attr_reader :name, :tags, :env_proc, :option_names
 
-  def initialize(name, tags=[])
+  DEFAULT_ENV_PROC = proc {}
+
+  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_names = [name])
     @name = name
     @tags = tags
+    @env_proc = env_proc
+    @option_names = option_names
   end
 
   def to_s
@@ -17,42 +20,31 @@ class Dependency
   end
 
   def ==(other)
-    name == other.name
+    instance_of?(other.class) && name == other.name && tags == other.tags
   end
-
-  def eql?(other)
-    instance_of?(other.class) && name == other.name
-  end
+  alias_method :eql?, :==
 
   def hash
-    name.hash
+    name.hash ^ tags.hash
   end
 
   def to_formula
-    f = Formula.factory(name)
-    # Add this dependency's options to the formula's build args
-    f.build.args = f.build.args.concat(options)
-    f
+    formula = Formulary.factory(name)
+    formula.build = BuildOptions.new(options, formula.options)
+    formula
   end
 
   def installed?
     to_formula.installed?
   end
 
-  def requested?
-    ARGV.formulae.include?(to_formula) rescue false
+  def satisfied?(inherited_options)
+    installed? && missing_options(inherited_options).empty?
   end
 
-  def satisfied?
-    installed? && missing_options.empty?
-  end
-
-  def missing_options
-    options - Tab.for_formula(to_formula).used_options - to_formula.build.implicit_options
-  end
-
-  def universal!
-    tags << 'universal' if to_formula.build.has_option? 'universal'
+  def missing_options(inherited_options)
+    required = options | inherited_options
+    required - Tab.for_formula(to_formula).used_options
   end
 
   def modify_build_environment
@@ -60,7 +52,7 @@ class Dependency
   end
 
   def inspect
-    "#<#{self.class}: #{name.inspect} #{tags.inspect}>"
+    "#<#{self.class.name}: #{name.inspect} #{tags.inspect}>"
   end
 
   # Define marshaling semantics because we cannot serialize @env_proc
@@ -78,27 +70,42 @@ class Dependency
     # the list.
     # The default filter, which is applied when a block is not given, omits
     # optionals and recommendeds based on what the dependent has asked for.
-    def expand(dependent, &block)
-      deps = dependent.deps.map do |dep|
+    def expand(dependent, deps = dependent.deps, &block)
+      # Keep track dependencies to avoid infinite cyclic dependency recursion.
+      @expand_stack ||= []
+      @expand_stack.push dependent.name
+
+      expanded_deps = []
+
+      deps.each do |dep|
+        next if dependent.name == dep.name
+
         case action(dependent, dep, &block)
         when :prune
-          next []
+          next
         when :skip
-          expand(dep.to_formula, &block)
+          next if @expand_stack.include? dep.name
+          expanded_deps.concat(expand(dep.to_formula, &block))
+        when :keep_but_prune_recursive_deps
+          expanded_deps << dep
         else
-          expand(dep.to_formula, &block) << dep
+          next if @expand_stack.include? dep.name
+          expanded_deps.concat(expand(dep.to_formula, &block))
+          expanded_deps << dep
         end
-      end.flatten
+      end
 
-      merge_repeats(deps)
+      merge_repeats(expanded_deps)
+    ensure
+      @expand_stack.pop
     end
 
-    def action(dependent, dep, &block)
+    def action(dependent, dep, &_block)
       catch(:action) do
         if block_given?
           yield dependent, dep
         elsif dep.optional? || dep.recommended?
-          prune unless dependent.build.with?(dep.name)
+          prune unless dependent.build.with?(dep)
         end
       end
     end
@@ -113,15 +120,64 @@ class Dependency
       throw(:action, :skip)
     end
 
-    def merge_repeats(deps)
-      grouped = deps.group_by(&:name)
+    # Keep a dependency, but prune its dependencies
+    def keep_but_prune_recursive_deps
+      throw(:action, :keep_but_prune_recursive_deps)
+    end
 
-      deps.uniq.map do |dep|
-        tags = grouped.fetch(dep.name).map(&:tags).flatten.uniq
-        merged_dep = dep.class.new(dep.name, tags)
-        merged_dep.env_proc = dep.env_proc
-        merged_dep
+    def merge_repeats(all)
+      grouped = all.group_by(&:name)
+
+      all.map(&:name).uniq.map do |name|
+        deps = grouped.fetch(name)
+        dep  = deps.first
+        tags = merge_tags(deps)
+        option_names = deps.flat_map(&:option_names).uniq
+        dep.class.new(name, tags, dep.env_proc, option_names)
       end
     end
+
+    private
+
+    def merge_tags(deps)
+      options = deps.flat_map(&:option_tags).uniq
+      merge_necessity(deps) + merge_temporality(deps) + options
+    end
+
+    def merge_necessity(deps)
+      # Cannot use `deps.any?(&:required?)` here due to its definition.
+      if deps.any? { |dep| !dep.recommended? && !dep.optional? }
+        [] # Means required dependency.
+      elsif deps.any?(&:recommended?)
+        [:recommended]
+      else # deps.all?(&:optional?)
+        [:optional]
+      end
+    end
+
+    def merge_temporality(deps)
+      if deps.all?(&:build?)
+        [:build]
+      elsif deps.all?(&:run?)
+        [:run]
+      else
+        [] # Means both build and runtime dependency.
+      end
+    end
+  end
+end
+
+class TapDependency < Dependency
+  attr_reader :tap
+
+  def initialize(name, tags = [], env_proc = DEFAULT_ENV_PROC, option_names = [name.split("/").last])
+    @tap = name.rpartition("/").first
+    super(name, tags, env_proc, option_names)
+  end
+
+  def installed?
+    super
+  rescue FormulaUnavailableError
+    false
   end
 end
